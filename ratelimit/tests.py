@@ -1,3 +1,6 @@
+import time
+
+from mock import patch
 from functools import partial
 
 from django.core.cache import cache, InvalidCacheBackendError
@@ -9,7 +12,12 @@ from django.views.generic import View
 
 from ratelimit.decorators import ratelimit
 from ratelimit.exceptions import Ratelimited
-from ratelimit.core import get_usage, is_ratelimited, _split_rate
+from ratelimit.core import (
+    get_usage,
+    is_ratelimited,
+    _split_rate,
+    check_extended_limited,
+)
 
 
 rf = RequestFactory()
@@ -418,6 +426,44 @@ class FunctionsTests(TestCase):
     def test_get_usage_called_without_group_or_fn(self):
         with self.assertRaises(ImproperlyConfigured):
             get_usage(rf.get('/'), key='ip')
+
+    @patch('ratelimit.core.EXPIRATION_FUDGE', 0)
+    def test_extended_limiting_in_usage(self):
+        _get_usage = partial(
+            get_usage,
+            method=get_usage.ALL,
+            key='ip',
+            rate='1/2s',
+            group='a',
+            limit_for=100,
+            increment=True,
+        )
+        _get_usage(rf.get('/'))
+        usage = _get_usage(rf.get('/'))
+        self.assertEqual(usage['extended_limit'], True)
+
+        time.sleep(3)
+
+        usage = _get_usage(rf.get('/'))
+        self.assertEqual(usage['extended_limit'], True)
+        self.assertEqual(usage['should_limit'], True)
+        self.assertEqual(usage['count'], 1)
+        self.assertEqual(usage['limit'], 1)
+        self.assertTrue(usage['time_left'] > 60)
+
+    def test_extended_limiting(self):
+        limit_for = 100
+        should_limit = True
+        group = 'a'
+        rate = '1/2s'
+        value = '127.0.0.1'
+        method = get_usage.ALL
+
+        extended_limits = check_extended_limited(
+            limit_for, should_limit, group, rate, value, method
+        )
+        self.assertEqual(extended_limits['extended_limit'], True)
+        self.assertTrue(extended_limits['time_left'] > 60)
 
 
 class RatelimitCBVTests(TestCase):
