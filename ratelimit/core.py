@@ -114,17 +114,80 @@ def _make_cache_key(group, window, rate, value, methods):
     return prefix + hashlib.md5(u''.join(parts).encode('utf-8')).hexdigest()
 
 
-def is_ratelimited(request, group=None, fn=None, key=None, rate=None,
-                   method=ALL, increment=False):
-    usage = get_usage(request, group, fn, key, rate, method, increment)
+def _get_cache():
+    cache_name = getattr(settings, 'RATELIMIT_USE_CACHE', 'default')
+    return caches[cache_name]
+
+
+def is_ratelimited(
+    request,
+    group=None,
+    fn=None,
+    key=None,
+    rate=None,
+    method=ALL,
+    increment=False,
+    limit_for=0,
+):
+    usage = get_usage(
+        request,
+        group,
+        fn,
+        key,
+        rate,
+        method,
+        increment,
+        limit_for,
+    )
     if usage is None:
         return False
 
     return usage['should_limit']
 
 
-def get_usage(request, group=None, fn=None, key=None, rate=None, method=ALL,
-              increment=False):
+def check_extended_limited(
+    limit_for,
+    should_limit,
+    group,
+    rate,
+    value,
+    method,
+):
+    if not limit_for:
+        return {}
+
+    cache = _get_cache()
+    extended_limit_cache_key = _make_cache_key(
+        group, str(limit_for), rate, value, method
+    )
+    ts = int(time.time())
+    if should_limit:
+        cache.add(
+            extended_limit_cache_key,
+            ts + limit_for,
+            limit_for + EXPIRATION_FUDGE,
+        )
+
+    extended_limit_ts = cache.get(extended_limit_cache_key, ts)
+    extended_limit_ttl = extended_limit_ts - ts
+    if extended_limit_ttl:
+        return {
+            'extended_limit': True,
+            'time_left': extended_limit_ttl,
+        }
+    return {}
+
+
+def get_usage(
+    request,
+    group=None,
+    fn=None,
+    key=None,
+    rate=None,
+    method=ALL,
+    increment=False,
+    limit_for=0,
+):
     if group is None and fn is None:
         raise ImproperlyConfigured('get_usage must be called with either '
                                    '`group` or `fn` arguments')
@@ -182,8 +245,7 @@ def get_usage(request, group=None, fn=None, key=None, rate=None, method=ALL,
     window = _get_window(value, period)
     initial_value = 1 if increment else 0
 
-    cache_name = getattr(settings, 'RATELIMIT_USE_CACHE', 'default')
-    cache = caches[cache_name]
+    cache = _get_cache()
     cache_key = _make_cache_key(group, window, rate, value, method)
 
     count = None
@@ -213,12 +275,23 @@ def get_usage(request, group=None, fn=None, key=None, rate=None, method=ALL,
             'time_left': -1,
         }
 
+    extended_limit = False
     time_left = window - int(time.time())
+    should_limit = count > limit
+
+    extended_limits = check_extended_limited(
+        limit_for, should_limit, group, rate, value, method
+    )
+    extended_limit = extended_limits.get('extended_limit', extended_limit)
+    time_left = max(extended_limits.get('time_left', 0), time_left)
+    should_limit |= extended_limit
+
     return {
         'count': count,
         'limit': limit,
-        'should_limit': count > limit,
+        'should_limit': should_limit,
         'time_left': time_left,
+        'extended_limit': extended_limit,
     }
 
 
